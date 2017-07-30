@@ -11,6 +11,7 @@ var util = require('util');
 var JSONbig = require('json-bigint');
 var mqtt = require('mqtt');
 var awsIot = require('aws-iot-device-sdk');
+var ObjectID = require('mongodb').ObjectID;
 
 function argchecker( argv ) {
     if (argv.db === true) throw 'MongoDB database name is unspecified. Use -d, --db <dbname>';
@@ -21,7 +22,7 @@ function argchecker( argv ) {
 var usage = 'Usage: $0 -u <username> -p <password> [-sz] \n' +
     '   [--file <filename>] [--db <MongoDB database>] \n' +
     '   [--mqtt <mqtt://hostname>] [--topic <mqtt_topic>] \n' +
-    '   [--values <value list>] [--maxrpm <#num>] [--vehicle offset] [--naptime <#num_mins>]'; 
+    '   [--values <value list>] [--maxrpm <#num>] [--vehicle offset] [--naptime <#num_mins>]';
 
 var s_url = 'https://streaming.vn.teslamotors.com/stream/';
 var collectionS, collectionA;
@@ -34,12 +35,13 @@ var slast = 0; // datetime for checking streaming request rates
 var srpm = 0; // Streaming URL Request Per Minute counter
 var lastss = "init"; // last shift state
 var ss = "init"; // shift state
-var napmode = false; // flag for enabling pause to allow sleep to set in 
+var napmode = false; // flag for enabling pause to allow sleep to set in
 var sleepmode = false;
+var tripID = false;
 var napTimeoutId;
 var sleepIntervalId;
 // various instance counters to avoid multiple concurrent instances
-var pcount = 0; 
+var pcount = 0;
 var scount = 0;
 var icount = 0;
 var ncount = 0;
@@ -76,7 +78,7 @@ var argv = require('optimist')
     .alias('N', 'napcheck')
     .describe('N', 'Number of minutes between nap checks')
     .default('N', 1)
-    .alias('O', 'vehicle')   
+    .alias('O', 'vehicle')
     .describe('O', 'Select the vehicle offset (i.e. 0 or 1) for accounts with multiple vehicles')
     .default('O', 0)
     .alias('S', 'sleepcheck')
@@ -109,6 +111,7 @@ if (!argv.db && !argv.awsiot && !argv.mqtt && !argv.file) {
     process.exit();
 }
 if (argv.db) {
+  tripID = false;
     MongoClient = require('mongodb').MongoClient;
     // TODO: maybe add a mongouri config paramter to the config.json so people can set this explicitly
     var mongoUri = process.env.MONGOLAB_URI|| process.env.MONGOHQ_URI || 'mongodb://127.0.0.1:27017/' + argv.db;
@@ -117,8 +120,9 @@ if (argv.db) {
         if(err) throw err;
         collectionS = db.collection('tesla_stream');
         collectionA = db.collection('tesla_aux');
+        collectionT = db.collection('tesla_trip');
     });
-} 
+}
 if (argv.awsiot) {
     var device = awsIot.device({
         keyPath: creds.awsiot.keyPath,    //path to your AWS Private Key
@@ -138,7 +142,7 @@ if (argv.awsiot) {
     device.on('connect', function() {
         ulog('awsiot device connected!');
     });
-} 
+}
 if (argv.mqtt) {
     var client  = mqtt.connect(argv.mqtt);
     if (!argv.topic) {
@@ -167,23 +171,23 @@ if (argv.ifttt) {
     }
 }
 
-function tsla_poll( vid, long_vid, token ) {    
+function tsla_poll( vid, long_vid, token ) {
     pcount++;
     if ( pcount > 1 ) {
         ulog('Too many pollers running, exiting this one');
         pcount = pcount - 1;
         return;
-    }   
+    }
     if (napmode) {
         ulog('Info: car is napping, skipping tsla_poll()');
         pcount = pcount - 1;
         return;
-    } 
+    }
     if (long_vid == undefined || token == undefined) {
         console.log('Error: undefined vehicle_id (' + long_vid +') or token (' + token +')');
         console.log('Exiting...');
         process.exit(1);
-    } 
+    }
     var now = new Date().getTime();
     if ( now - slast < 60000) { // last streaming request was less than 1 minute ago
         ulog( srpm + ' of ' + argv.maxrpm + ' Stream requests since ' + slast);
@@ -193,12 +197,12 @@ function tsla_poll( vid, long_vid, token ) {
             slast = now;
         } else if (srpm > argv.maxrpm ) {
             ulog('Warn: throttling due to too many streaming requests per minute');
-            setTimeout(function() { 
+            setTimeout(function() {
                 tsla_poll( vid, long_vid, token );
             }, 60000);  // 1 minute
             pcount = pcount - 1;
             return;
-        }   
+        }
     } else { // longer than a minute since last request
         srpm = 0;
         slast = now;
@@ -207,16 +211,16 @@ function tsla_poll( vid, long_vid, token ) {
     if ( argv.zzz == true && lastss == "" && ss == "") {
         //if not charging stop polling for 30 minutes
         rpm++;
-        teslams.get_charge_state( vid, function (cs) { 
+        teslams.get_charge_state( vid, function (cs) {
             if (cs.charging_state == 'Charging') {
                 ulog('Info: car is charging, continuing to poll for data');
             } else {
                 if (ncount == 0) {
-                    ncount++;               
+                    ncount++;
                     ulog('Info: 30 minute nap starts now');
                     napmode = true;
-                    // 30 minutes of nap mode to let the car fall asleep        
-                    napTimeoutId = setTimeout(function() { 
+                    // 30 minutes of nap mode to let the car fall asleep
+                    napTimeoutId = setTimeout(function() {
                         ncount = 0;
                         clearInterval(sleepIntervalId);
                         scount = 0;
@@ -228,20 +232,20 @@ function tsla_poll( vid, long_vid, token ) {
                 } else {
                     ulog('Debug: (' + ncount + ') Nap timer is already running. Not starting another');
                 }
-                // check if sleep has set in every minute (default) 
+                // check if sleep has set in every minute (default)
                 if (scount == 0) {
                     scount++;
                     sleepIntervalId = setInterval(function() {
                         if (napmode == true) {
                             rpm++;
-                            // adding support for selecting which vehicle to poll from a multiple vehicle account 
+                            // adding support for selecting which vehicle to poll from a multiple vehicle account
                             teslams.all( { email: creds.username, password: creds.password }, function ( error, response, body ) {
                                 var vdata, vehicles;
                                 //check we got a valid JSON response from Tesla
-                                try { 
-                                    vdata = JSONbig.parse(body); 
-                                } catch(err) { 
-                                    console.log('Error: login failed, unable to parse vehicle data'); 
+                                try {
+                                    vdata = JSONbig.parse(body);
+                                } catch(err) {
+                                    console.log('Error: login failed, unable to parse vehicle data');
                                     process.exit(1);
                                 }
                                 //check we got an array of vehicles and get the right one using the (optionally) specified offset
@@ -252,10 +256,10 @@ function tsla_poll( vid, long_vid, token ) {
                                 vehicles = vdata.response[argv.vehicle]; // cast to a string for BigInt protection????
                                 if (vehicles === undefined) {
                                     console.log( 'No vehicle data returned for car number ' + argv.vehicle);
-                                    process.exit(1);    
+                                    process.exit(1);
                                 }
-                            // end of new block added for multi-vehicle support                          
-                            //teslams.vehicles( { email: creds.username, password: creds.password }, function ( vehicles ) {  
+                            // end of new block added for multi-vehicle support
+                            //teslams.vehicles( { email: creds.username, password: creds.password }, function ( vehicles ) {
                                 if ( typeof vehicles.state != undefined ) {
                                     ulog( 'Vehicle state is: ' + vehicles.state );
                                     if (vehicles.state == 'asleep' || vehicles.state == 'unknown') {
@@ -273,7 +277,7 @@ function tsla_poll( vid, long_vid, token ) {
                                     ulog( 'Nap checker: undefined vehicle state' );
                                 }
                             });
-                        }                   
+                        }
                     }, argv.sleepcheck); // every 1 minute  (default)
                 } else {
                     ulog('Debug: (' + scount + ') Sleep checker is already running. Not starting another');
@@ -281,7 +285,7 @@ function tsla_poll( vid, long_vid, token ) {
             }
         });
         // need to check again if nap mode flag had been changed above
-        // [HJ] added some code to the .on('data') function below to detect and cancel 
+        // [HJ] added some code to the .on('data') function below to detect and cancel
         // nap mode if the car starts driving again.
         if (napmode == true) {
             ulog('Info: code just entered nap mode but we will start one last poll');
@@ -289,7 +293,7 @@ function tsla_poll( vid, long_vid, token ) {
             // ulog('Info: code just entered nap mode canceling long poll');
             // pcount = pcount - 1;
             // return;
-        } 
+        }
     }
     srpm++; //increment the number of streaming requests per minute
     request({'uri': s_url + long_vid +'/?values=' + argv.values,
@@ -354,10 +358,10 @@ function tsla_poll( vid, long_vid, token ) {
         }
     }).on('data', function(data) {
         // TODO: parse out shift_state field and assign to a global for better sleep checking
-        var d, vals, record, doc;              
+        var d, vals, record, doc;
 		d = data.toString().trim();
 		vals = d.split(/[,\n\r]/);
-		//check we have a valid timestamp to avoid interpreting corrupt stream data             
+		//check we have a valid timestamp to avoid interpreting corrupt stream data
 		if ( isNaN(vals[0]) || vals[0] < 1340348400000) { //tesla epoch
 			ulog('Bad timestamp (' + vals[0] + ')' );
 		} else {
@@ -366,24 +370,62 @@ function tsla_poll( vid, long_vid, token ) {
                 	doc = { 'ts': +vals[0], 'record': record };
                 	collectionS.insert(doc, { 'safe': true }, function(err,docs) {
                         if(err) util.log(err);
-                	});   
-            } 
+                	});
+
+                  // Check if trip started or ended
+                  if (tripID !== false) {
+                    if (vals[9] == 'P' || vals[9] == '') {
+                      ulog('======Trip ended!=====');
+                      collectionT.findOne({_id: tripID}, function (err, docs) {
+                        if(err) util.log(err);
+                        else {
+                          collectionT.update({_id: tripID}, {$set: {
+                            'tripStopTS': +vals[0],
+                            'stopRecord': record,
+                            'length': Number(record[2]) - Number(docs.startRecord[2]),
+                            'rangeUsed': Number(docs.startRecord[10]) - Number(record[10]),
+                            'est_rangeUsed': Number(docs.startRecord[11]) - Number(record[11]),
+                            'duration': Number(record[0]) - Number(docs.ts)
+                          }, function (err,docs) {
+                            if (err) util.log(err);
+                            else {
+                              ulog('===Saved trip with id '+tripID+'===');
+                            }
+                            tripID = false;
+                          }});
+                        }
+                      });
+                      // Reset tripID
+
+                    }
+                  } else if (tripID == false) {
+                    if (vals[9] == 'D' || vals[9] == 'R') {
+                      ulog('=====Trip started===');
+                      collectionT.insert({'ts': +vals[0], 'tripStartTS': +vals[0], 'startRecord': record}, { 'safe': true }, function (err,docs) {
+                        if (err) util.log(err);
+                        tripID = docs.ops[0]._id;
+                        console.log('Trip id', tripID);
+                      });
+                    }
+                  }
+
+            }
             if ((argv.mqtt || argv.awsiot) && argv.topic) {
                 //publish to MQTT broker on specified topic
                 var newchunk = d.replace(/[\n\r]/g, '');
                 var array = newchunk.split(',');
-                var streamdata = { 
+                var streamdata = {
                     id_s : vid.toString(),
                     vehicle_id : long_vid,
-                    timestamp : array[0], 
-                    speed : array[1], 
-                    odometer : array[2], 
-                    soc : array[3], 
-                    elevation : array[4], 
-                    est_heading : array[5], 
-                    est_lat : array[6], 
-                    est_lng : array[7], 
-                    power : array[8], 
+                    timestamp : array[0],
+                    speed : array[1],
+                    odometer : array[2],
+                    soc : array[3],
+                    elevation : array[4],
+                    est_heading : array[5],
+                    est_lat : array[6],
+                    est_lng : array[7],
+                    power : array[8],
                     shift_state : array[9],
                     range : array[10],
                     est_range : array[11],
@@ -401,12 +443,12 @@ function tsla_poll( vid, long_vid, token ) {
                     }
                 }
                 if (argv.awsiot) {
-                    try {                    
+                    try {
                         //Argh!!!! AWS DynamoDB doesn't allow empty strings so replace will null values.
                         var dynamoDBdata = JSON.stringify(streamdata, function(k, v) {
                             if (v === "") {
                                 return null;
-                            } 
+                            }
                             return v;
                         });
                         device.publish(argv.topic + '/' + vid+ '/stream', dynamoDBdata);
@@ -415,20 +457,20 @@ function tsla_poll( vid, long_vid, token ) {
                         console.log('Error while publishing message to aws iot: ' + error.toString());
                     }
                 }
-            }  
+            }
             if (argv.file) {
                 stream.write(data);
-            } 
+            }
             //after data is written and/or published deal with the napmode stuff
-            lastss = ss; 
+            lastss = ss;
             ss = vals[9]; // TODO: fix hardcoded position for shift_state
             // [HJ] this section goes with the code above which allows one last poll
             // after entering nap mode. If this turns out to cause other problems
             // remove this nap cancel section AND switch back to disabling this
             // final poll
             if (napmode == true && ss != '') {
-                //cancel nap mode           
-                ulog('Info: canceling nap mode because shift_state is now (' + ss + ')'); 
+                //cancel nap mode
+                ulog('Info: canceling nap mode because shift_state is now (' + ss + ')');
                 clearTimeout(napTimeoutId);
                 ncount = 0;
                 clearInterval(sleepIntervalId);
@@ -439,7 +481,7 @@ function tsla_poll( vid, long_vid, token ) {
                 initstream();
             }
         }
-    });     
+    });
 }
 
 function getAux() {
@@ -487,8 +529,8 @@ function getAux() {
             }
             if (argv.ifttt) {
                 var options = {
-                    method: 'POST', 
-                    url: ifttt, 
+                    method: 'POST',
+                    url: ifttt,
                     form: { value1: "charge_state", value2: JSON.stringify(data) }
                 };
                 request( options, function (error, response, body) {
@@ -502,7 +544,7 @@ function getAux() {
             if (ds.length > 2 && ds != JSON.stringify(getAux.climate)) {
                 getAux.climate = data;
                 doc = { 'ts': new Date().getTime(), 'climateState': data };
-                if (argv.db && (data.inside_temp !== undefined)) {                  
+                if (argv.db && (data.inside_temp !== undefined)) {
                     collectionA.insert(doc, { 'safe': true }, function(err,docs) {
                         if(err) throw err;
                     });
@@ -520,15 +562,15 @@ function getAux() {
                 }
                 if (argv.ifttt) {
                     var options = {
-                        method: 'POST', 
-                        url: ifttt, 
+                        method: 'POST',
+                        url: ifttt,
                         form: { value1: "climate_state", value2: JSON.stringify(data) }
                     };
                     request( options, function (error, response, body) {
                         ulog( 'IFTTT POST returned ' + response.statusCode );
                     });
                 }
-            }    
+            }
         });
     }
 }
@@ -543,7 +585,7 @@ function storeVehicles(vehicles) {
     if (argv.mqtt) {
         //publish vehicles data
         try {
-            // make this unique somehow 
+            // make this unique somehow
             client.publish(argv.topic + '/vehicles', JSON.stringify(doc));
         } catch (error) {
             // failed to send, therefore stop publishing and log the error thrown
@@ -611,12 +653,12 @@ function initstream() {
         ulog('Debug: Too many initializers running, exiting this one');
         icount = icount - 1;
         return;
-    }   
+    }
     if (napmode) {
         ulog('Info: car is napping, skipping initstream()');
         icount = icount - 1;
         return;
-    } 
+    }
     // make absolutely sure we don't overwhelm the API
     var now = new Date().getTime();
     if ( now - last < 60000) { // last request was within the past minute
@@ -627,27 +669,27 @@ function initstream() {
             last = now;
         } else if (rpm > argv.maxrpm) { // throttle check
             util.log('Warn: throttling due to too many REST API requests');
-            setTimeout(function() { 
-                initstream(); 
+            setTimeout(function() {
+                initstream();
             }, 60000); // 1 minute
             icount = icount - 1;
             return;
-        }       
+        }
     } else { // longer than a minute since last request
         last = now;
         rpm = 0; // reset the REST API request counter
     }
     rpm++; // increment the REST API request counter
-    // adding support for selecting which vehicle to poll from a multiple vehicle account 
+    // adding support for selecting which vehicle to poll from a multiple vehicle account
     teslams.all( { email: creds.username, password: creds.password }, function ( error, response, body ) {
         var vdata, vehicles;
         //check we got a valid JSON response from Tesla
-        try { 
-            vdata = JSONbig.parse(body); 
-        } catch(err) { 
-            ulog('Error: unable to parse vehicle data response as JSON, login failed. Trying again.'); 
-            setTimeout(function() { 
-                initstream(); 
+        try {
+            vdata = JSONbig.parse(body);
+        } catch(err) {
+            ulog('Error: unable to parse vehicle data response as JSON, login failed. Trying again.');
+            setTimeout(function() {
+                initstream();
             }, 10000); // 10 second
             icount = icount - 1;
             return;
@@ -663,10 +705,10 @@ function initstream() {
         vehicles = vdata.response[argv.vehicle];
         if (vehicles === undefined) {
             ulog('Error: No vehicle data returned for car number ' + argv.vehicle);
-            process.exit(1);    
+            process.exit(1);
         }
     // end of new block added for multi-vehicle support
-    // teslams.vehicles( { email: creds.username, password: creds.password }, function ( vehicles ) {  
+    // teslams.vehicles( { email: creds.username, password: creds.password }, function ( vehicles ) {
         if ( typeof vehicles == "undefined" ) {
             console.log('Error: undefined response to vehicles request' );
             console.log('Exiting...');
@@ -683,22 +725,22 @@ function initstream() {
             ulog('Info: car is in (' + vehicles.state + ') state, will check again in ' + timeDelta);
             napmode = true;
             // wait for 1 minute (default) and check again if car is asleep
-            setTimeout(function() { 
+            setTimeout(function() {
                 napmode = false;
                 sleepmode = true;
                 initstream();
             }, argv.napcheck); // 1 minute (default)
             icount = icount - 1;
-            return;     
+            return;
         } else if ( typeof vehicles.tokens == "undefined" || vehicles.tokens[0] == undefined ) {
             ulog('Info: car is in (' + vehicles.state + ') state, calling /charge_state to reveal the tokens');
-            rpm++;  // increment the REST API request counter           
+            rpm++;  // increment the REST API request counter
             teslams.get_charge_state( vehicles.id, function( resp ) {
                 if ( resp.charging_state != undefined ) {
                     // returned valid response so re-initialize right away
                     ulog('Debug: charge_state request succeeded (' + resp.charging_state + '). \n  Reinitializing...');
-                    setTimeout(function() { 
-                        initstream(); 
+                    setTimeout(function() {
+                        initstream();
                     }, 1000); // 1 second
                     icount = icount - 1;
                     return;
@@ -706,19 +748,19 @@ function initstream() {
                     ulog('Warn: waking up with charge_state request failed.\n  Waiting 30 secs and then reinitializing...');
                     // charge_state failed. wait 30 seconds before trying again to reinitialize
                     // no need to set napmode = true because we are trying to wake up anyway
-                    setTimeout(function() { 
-                        initstream(); 
-                    }, 30000);   // 30 seconds    
+                    setTimeout(function() {
+                        initstream();
+                    }, 30000);   // 30 seconds
                     icount = icount - 1;
-                    return;       
-                } 
-            }); 
+                    return;
+                }
+            });
         } else { // this is the valid condition so we have the required tokens and ids
             sleepmode = false;
             if (firstTime) {    // initialize only once
                 firstTime = false;
                 initdb(vehicles);
-                if (argv.file) { // initialize first line of CSV file output with field names 
+                if (argv.file) { // initialize first line of CSV file output with field names
                     stream.write('timestamp,' + argv.values + '\n');
                 }
             }
@@ -726,7 +768,7 @@ function initstream() {
             icount = icount - 1;
             return;
         }
-    }); 
+    });
 }
 
 // this is the main part of this program
